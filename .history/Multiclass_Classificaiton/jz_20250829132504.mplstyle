@@ -1,0 +1,11 @@
+
+    axes.titlesize : 11
+    axes.labelsize : 11
+    axes.linewidth : 0.75
+    lines.linewidth : 1.5
+    lines.markersize : 8
+    xtick.labelsize : 11
+    ytick.labelsize : 11
+    figure.figsize : 3.5, 3.0
+    figure.dpi : 300
+    

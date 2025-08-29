@@ -1,0 +1,13 @@
+# JZ's fig style for scientific papers
+# how to use: plt.style.use('jz')
+# place this in the system stylelib folder
+axes.titlesize : 11
+axes.labelsize : 11
+axes.linewidth : 0.75
+lines.linewidth : 1.5
+lines.markersize : 8
+xtick.labelsize : 11
+ytick.labelsize : 11
+figure.figsize   : 2.613, 2.613   ## figure size in inches
+figure.dpi       : 300        ## figure dots per inch
+    
