@@ -229,10 +229,7 @@ def optimize_theta(theta, z_centers, lam, epsilon, method, itr=100, lr=0.01, num
     return theta, his
 
 if __name__ == '__main__':
-    z_main = np.random.normal(4, 1, (10,2))  # Main cluster
-    outliers = np.array([[-1.0, -3.0], [-2.0, -2.0]])
-    #z_main = np.array([[4.0, 5.0],[5.0, 4.0], [4.0, 4.0], [5,5], [-2.0, -2.0]]) 
-    z_with_outliers = np.vstack((z_main, outliers))
+    z_main = np.array([[4.0, 5.0],[5.0, 4.0], [4.0, 4.0], [5,5], [-2.0, -2.0]]) 
     lambdas_to_test = [5, 10, 20]
     epsilons_to_test = [0.001, 0.01, 0.1]
     theta_to_test = np.array([[4.0, 4.0], [0.0, 0.0], [-1.0, -1.0]])  # Example theta for testing
