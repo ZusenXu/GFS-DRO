@@ -195,7 +195,7 @@ def wfr_sampler(x_original_batch, y_original_batch, model, epoch, lr=inner_lr, i
         x_clone = (mean_expanded + noise).view(-1, INPUT_DIM)
 
         with torch.no_grad():
-            new_loss = nn.CrossEntropyLoss(reduction='none')(model(x_clone), y_repeated).view(batch_size, -1)
+            new_loss = nn.CrossEntropyLoss(reduction='none')(model(x_clone), y_repeated).view(batch_size, -1) - 2 * LAMBDA_PARAM * torch.sum((x_clone - x_original_expanded) ** 2, dim=1).view(batch_size, -1)
 
             weights = weights ** weight_exponent * torch.exp(new_loss * wt_lr)
 
@@ -457,7 +457,7 @@ def plot_wfr_weights_evolution(model, X_train, y_train, output_dir, lr=1e-2, inn
 
         # Update weights based on the new positions
         with torch.no_grad():
-            new_loss = nn.CrossEntropyLoss(reduction='none')(model(x_clone), y_repeated).view(1, -1)
+            new_loss = nn.CrossEntropyLoss(reduction='none')(model(x_clone), y_repeated).view(1, -1) - 2 * LAMBDA_PARAM * torch.sum((x_clone - x_original_expanded) ** 2, dim=1).view(1, -1)
             weights = weights ** weight_exponent * torch.exp(new_loss * wt_lr)
             weights = weights / (torch.sum(weights, dim=1, keepdim=True) + 1e-9)
 
