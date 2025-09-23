@@ -1,0 +1,348 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+
+# --- Experiment Setup & Parameter Definitions ---
+# Define the problem's dimensions
+DIM_M = 10  # Number of rows for matrix A
+DIM_N = 10  # Number of columns for matrix A (dimension of theta)
+
+# Define the number of training/test samples
+N_TRAIN_SAMPLES = 20
+N_TEST_SAMPLES = 1000
+
+# Define the perturbation range for distribution shift
+DELTA_MIN = 0.0
+DELTA_MAX = 10.0
+DELTA_STEPS = 50
+
+# --- DRO Algorithm Hyperparameters ---
+N_EPOCHS = 50  # Number of iterations for the outer optimization
+LEARNING_RATE = 0.01  # Learning rate for the outer optimization of theta
+LAMBDA_VAL = 1  # Regularization parameter lambda
+EPSILON = 0.5  # Entropy regularization parameter epsilon
+GRAD_CLIP_THRESHOLD = 100.0  # Gradient clipping threshold to prevent explosion
+
+# WGF (Algorithm 3), WFR (Algorithm 4), WRM, MMD-DRO Specific Parameters
+K_INNER_STEPS = 3000  # Number of inner loop iterations K
+INNER_STEP_SIZE = 0.0001  # Inner loop step size eta
+
+# WFR Specific Parameters
+WFR_WEIGHT_STEP_SIZE = 0.0016  # Step size for weight updates in WFR
+
+# WGF, WFR, MMD-DRO Specific Parameters
+M_PARTICLES = 8  # Number of particles (samples) used
+
+# MMD-DRO Specific Parameters
+MMD_NOISE_STD = 0.01 # Noise standard deviation for Langevin dynamics
+
+# --- Generate a Fixed Problem Instance ---
+np.random.seed(219)
+A0 = np.random.randn(DIM_M, DIM_N)
+A1 = np.random.randn(DIM_M, DIM_N)
+b = np.random.randn(DIM_M)
+
+# --- Data Generation Functions ---
+def generate_training_data(n_samples):
+    """Generates training data."""
+    return np.random.uniform(-0.5, 0.5, n_samples)
+
+def generate_test_data(n_samples, delta):
+    """Generates test data with a distributional shift."""
+    lower_bound = -0.5 * (1 + delta)
+    upper_bound = 0.5 * (1 + delta)
+    return np.random.uniform(lower_bound, upper_bound, n_samples)
+
+# --- Core Function Definitions (Vectorized) ---
+def loss_function(theta, z):
+    """ Computes the loss f_theta(z) for a single sample or a batch of samples z. """
+    z = np.atleast_1d(z)
+    A_z = A0[np.newaxis, :, :] + z[:, np.newaxis, np.newaxis] * A1[np.newaxis, :, :]
+    residual = A_z @ theta - b[np.newaxis, :]
+    loss = np.sum(residual**2, axis=1) / DIM_M
+    return loss.squeeze()
+
+def loss_grad_theta(theta, z):
+    """ Computes the gradient of the loss function with respect to theta for one or a batch of z. """
+    z = np.atleast_1d(z)
+    A_z = A0[np.newaxis, :, :] + z[:, np.newaxis, np.newaxis] * A1[np.newaxis, :, :]
+    residual = A_z @ theta - b[np.newaxis, :]
+    grad = 2 * (A_z.transpose(0, 2, 1) @ residual[:, :, np.newaxis]).squeeze(axis=2)
+    return grad.squeeze()
+
+def loss_grad_z(theta, z):
+    """ Computes the gradient of the loss function with respect to z for one or a batch of z. """
+    z = np.atleast_1d(z)
+    residual = (A0[np.newaxis, :, :] + z[:, np.newaxis, np.newaxis] * A1[np.newaxis, :, :]) @ theta - b[np.newaxis, :]
+    grad_A_z = A1 @ theta
+    grad = 2 * np.sum(residual * grad_A_z[np.newaxis, :], axis=1)
+    return grad.squeeze()
+
+# --- ERM (Empirical Risk Minimization) Implementation ---
+def erm_objective_function(theta, xi_samples):
+    """ Calculates the ERM objective function value (average loss). """
+    return np.mean(loss_function(theta, xi_samples))
+
+def solve_erm(xi_train_samples):
+    """ Solves the ERM problem using an optimizer. """
+    initial_theta = np.zeros(DIM_N)
+    result = minimize(
+        erm_objective_function, initial_theta, args=(xi_train_samples,), method='BFGS')
+    if not result.success:
+        print("Warning: ERM optimization may not have converged.")
+    return result.x
+
+# --- MMD-DRO (Maximum Mean Discrepancy DRO) Implementation ---
+def imq_kernel_and_grad_numpy(x, y, c=1.0, beta=-0.5):
+    """
+    Computes the Inverse Multi-Quadric (IMQ) kernel and its gradient w.r.t. x.
+    k(x, y) = (c + ||x - y||^2)^beta
+    Args:
+        x (np.ndarray): Input array of shape (N, D).
+        y (np.ndarray): Input array of shape (M, D).
+    Returns:
+        tuple: A tuple containing:
+            - np.ndarray: The kernel matrix of shape (N, M).
+            - np.ndarray: The gradient of the kernel w.r.t. x, of shape (N, M, D).
+    """
+    diffs = x[:, np.newaxis, :] - y[np.newaxis, :, :]  # Shape: (N, M, D)
+    sq_dists = np.sum(diffs**2, axis=2)  # Shape: (N, M)
+    
+    # Kernel matrix
+    kernel_matrix = (c + sq_dists)**beta
+    
+    # Gradient of the kernel w.r.t. x
+    # grad_k_x = 2 * beta * diffs * (c + sq_dists)^(beta - 1)
+    grad_multiplier = 2 * beta * (c + sq_dists)**(beta - 1)
+    grad_k_x = diffs * grad_multiplier[:, :, np.newaxis]
+    
+    return kernel_matrix, grad_k_x
+
+def solve_mmd_dro(xi_train_samples):
+    """ Solves Sinkhorn DRO using an MMD gradient flow sampler. """
+    theta = np.zeros(DIM_N)
+    num_train = len(xi_train_samples)
+
+    for epoch in range(N_EPOCHS):
+        # Initialize particles for each training point
+        particles = np.tile(xi_train_samples[:, np.newaxis], (1, M_PARTICLES))
+
+        # Dynamically adjust inner steps based on the epoch
+        current_inner_steps = int(max(5, K_INNER_STEPS * (epoch + 1) / N_EPOCHS))
+        
+        for _ in range(current_inner_steps):
+            particles_flat = particles.flatten()
+            
+            # Step A: Compute loss gradient ∇f(z_i) for each particle
+            loss_grads = loss_grad_z(theta, particles_flat)
+
+            # Step B: Compute kernel gradients for MMD terms
+            # For vectorization, we treat all particles as one batch
+            # and original points as another.
+            particles_reshaped = particles_flat[:, np.newaxis]
+            xi_train_reshaped = xi_train_samples[:, np.newaxis]
+
+            # Term 1: Interaction among perturbed particles (∇_x k(x, y))
+            _, grad_K_clone = imq_kernel_and_grad_numpy(particles_reshaped, particles_reshaped)
+            mmd_term1 = np.mean(grad_K_clone, axis=1).squeeze()
+
+            # Term 2: Interaction with original batch points (∇_x k(x, z))
+            _, grad_K_orig = imq_kernel_and_grad_numpy(particles_reshaped, xi_train_reshaped)
+            mmd_term2 = np.mean(grad_K_orig, axis=1).squeeze()
+
+            # Step C: Compute the total velocity
+            velocity = loss_grads - LAMBDA_VAL * (mmd_term1 - mmd_term2)
+
+            # Step D: Add random noise for Langevin dynamics
+            noise = np.random.randn(*particles_flat.shape) * MMD_NOISE_STD
+            
+            # Step E: Update particle positions (gradient ascent + noise)
+            particles_flat = particles_flat + INNER_STEP_SIZE * velocity + noise
+            particles = particles_flat.reshape(num_train, M_PARTICLES)
+        
+        # After inner loop, compute the gradient w.r.t. theta using final particles
+        all_grads = loss_grad_theta(theta, particles.flatten())
+        avg_particle_grads = all_grads.reshape(num_train, M_PARTICLES, -1).mean(axis=1)
+        total_grad = avg_particle_grads.sum(axis=0)
+            
+        avg_grad = total_grad / num_train
+        grad_norm = np.linalg.norm(avg_grad)
+        if grad_norm > GRAD_CLIP_THRESHOLD:
+            avg_grad = avg_grad * GRAD_CLIP_THRESHOLD / grad_norm
+        theta -= LEARNING_RATE * avg_grad
+        
+    return theta
+    
+# --- Wasserstein Gradient Flow (WGF) Implementation (Vectorized) ---
+def solve_wgf(xi_train_samples):
+    """ Solves Sinkhorn DRO using Wasserstein Gradient Flow (WGF). """
+    theta = np.zeros(DIM_N)
+    num_train = len(xi_train_samples)
+    
+    def f_bar_grad_z(z, xi, current_theta):
+        grad_f = loss_grad_z(current_theta, z)
+        return grad_f - 2 * LAMBDA_VAL * (z - xi)
+
+    for epoch in range(N_EPOCHS):
+        particles = np.tile(xi_train_samples[:, np.newaxis], (1, M_PARTICLES))
+        
+        for _ in range(K_INNER_STEPS):
+            particles_flat = particles.flatten()
+            xi_expanded = np.repeat(xi_train_samples, M_PARTICLES)
+            
+            grad = f_bar_grad_z(particles_flat, xi_expanded, theta)
+            noise = np.random.normal(0, 1, size=particles_flat.shape)
+            
+            updated_particles_flat = particles_flat + INNER_STEP_SIZE * grad + np.sqrt(2 * INNER_STEP_SIZE * LAMBDA_VAL * EPSILON) * noise
+            particles = updated_particles_flat.reshape(num_train, M_PARTICLES)
+            
+        all_grads = loss_grad_theta(theta, particles.flatten())
+        avg_particle_grads = all_grads.reshape(num_train, M_PARTICLES, -1).mean(axis=1)
+        total_grad = avg_particle_grads.sum(axis=0)
+            
+        avg_grad = total_grad / num_train
+        grad_norm = np.linalg.norm(avg_grad)
+        if grad_norm > GRAD_CLIP_THRESHOLD:
+            avg_grad = avg_grad * GRAD_CLIP_THRESHOLD / grad_norm
+        theta -= LEARNING_RATE * avg_grad
+        
+    return theta
+
+# --- WFR Flow (Algorithm 4) Implementation (Vectorized) ---
+def solve_wfr(xi_train_samples):
+    """ Solves Sinkhorn DRO using WFR Flow. """
+    theta = np.zeros(DIM_N)
+    num_train = len(xi_train_samples)
+    
+    def f_bar_grad_z(z, xi, current_theta):
+        grad_f = loss_grad_z(current_theta, z)
+        return grad_f - 2 * LAMBDA_VAL * (z - xi)
+
+    for epoch in range(N_EPOCHS):
+        particles = np.tile(xi_train_samples[:, np.newaxis], (1, M_PARTICLES))
+        weights = np.full((num_train, M_PARTICLES), 1.0 / M_PARTICLES)
+        
+        for _ in range(K_INNER_STEPS):
+            particles_flat = particles.flatten()
+            xi_expanded = np.repeat(xi_train_samples, M_PARTICLES)
+            
+            grad = f_bar_grad_z(particles_flat, xi_expanded, theta)
+            noise = np.random.normal(0, 1, size=particles_flat.shape)
+            updated_particles_flat = particles_flat + INNER_STEP_SIZE * grad + np.sqrt(2 * INNER_STEP_SIZE * LAMBDA_VAL * EPSILON) * noise
+            particles = updated_particles_flat.reshape(num_train, M_PARTICLES)
+            
+            f_bar_val = loss_function(theta, particles.flatten()).reshape(particles.shape) - LAMBDA_VAL * (particles - xi_train_samples[:, np.newaxis])**2
+            weights = (weights**(1 - LAMBDA_VAL * EPSILON * WFR_WEIGHT_STEP_SIZE)) * np.exp(WFR_WEIGHT_STEP_SIZE * f_bar_val)
+            
+            sum_weights = np.sum(weights, axis=1, keepdims=True)
+            weights /= (sum_weights + 1e-9)
+            
+        all_grads = loss_grad_theta(theta, particles.flatten()).reshape(num_train, M_PARTICLES, -1)
+        weighted_grads = np.sum(weights[:, :, np.newaxis] * all_grads, axis=1)
+        total_grad = np.sum(weighted_grads, axis=0)
+        
+        avg_grad = total_grad / num_train
+        grad_norm = np.linalg.norm(avg_grad)
+        if grad_norm > GRAD_CLIP_THRESHOLD:
+            avg_grad = avg_grad * GRAD_CLIP_THRESHOLD / grad_norm
+        theta -= LEARNING_RATE * avg_grad
+        
+    return theta
+
+# --- WRM (Wasserstein Robust Method) Implementation (Vectorized) ---
+def solve_wrm(xi_train_samples):
+    """ Solves using WRM (deterministic inner optimization). """
+    theta = np.zeros(DIM_N)
+    num_train = len(xi_train_samples)
+    
+    def f_bar_grad_z(z, xi, current_theta):
+        grad_f = loss_grad_z(current_theta, z)
+        return grad_f - 2 * LAMBDA_VAL * (z - xi)
+
+    for epoch in range(N_EPOCHS):
+        z_k = xi_train_samples.copy()
+        for _ in range(K_INNER_STEPS):
+            grad = f_bar_grad_z(z_k, xi_train_samples, theta)
+            z_k += INNER_STEP_SIZE * grad
+            
+        total_grad = loss_grad_theta(theta, z_k).sum(axis=0)
+            
+        avg_grad = total_grad / num_train
+        grad_norm = np.linalg.norm(avg_grad)
+        if grad_norm > GRAD_CLIP_THRESHOLD:
+            avg_grad = avg_grad * GRAD_CLIP_THRESHOLD / grad_norm
+        theta -= LEARNING_RATE * avg_grad
+        
+    return theta
+
+# --- Experiment Execution and Evaluation ---
+def run_experiment():
+    """ Executes the complete experimental procedure. """
+    xi_train = generate_training_data(N_TRAIN_SAMPLES)
+    
+    print("Solving ERM model...")
+    theta_erm = solve_erm(xi_train)
+    print("Solving MMD-DRO model...")
+    theta_mmd_dro = solve_mmd_dro(xi_train)
+    print("Solving WGF model...")
+    theta_wgf = solve_wgf(xi_train)
+    print("Solving WFR model...")
+    theta_wfr = solve_wfr(xi_train)
+    print("Solving WRM model...")
+    theta_wrm = solve_wrm(xi_train)
+    print("All models solved.")
+
+    delta_values = np.linspace(DELTA_MIN, DELTA_MAX, DELTA_STEPS)
+    results = {'ERM': [], 'MMD-DRO': [], 'WGF': [], 'WFR': [], 'WRM': []}
+    models = {
+        'ERM': theta_erm, 'MMD-DRO': theta_mmd_dro, 'WGF': theta_wgf,
+        'WFR': theta_wfr, 'WRM': theta_wrm
+    }
+
+    print("Evaluating all models...")
+    for delta in delta_values:
+        xi_test = generate_test_data(N_TEST_SAMPLES, delta)
+        for name, theta in models.items():
+            test_loss = erm_objective_function(theta, xi_test)
+            results[name].append(test_loss)
+            
+    print("Evaluation complete.")
+    return delta_values, results
+
+# --- Results Visualization ---
+def plot_results(delta_values, results):
+    """ Plots the loss curves for all models against the perturbation delta. """
+    fig, ax = plt.subplots(figsize=(3.5, 2.613), dpi=300)
+
+    styles = {
+        'ERM': {'color': 'k', 'linestyle': '--'},
+        'MMD-DRO': {'color': '#9467bd', 'linestyle': '-'},
+        'WGF': {'color': '#d62728', 'linestyle': '-.'},
+        'WFR': {'color': '#2ca02c', 'linestyle': ':'},
+        'WRM': {'color': '#ff7f0e', 'linestyle': (0, (3, 1, 1, 1))},
+    }
+    
+    for name, losses in results.items():
+        if name in styles:
+             ax.plot(delta_values, losses, linewidth=1.5, label=name, **styles[name])
+
+    ax.set_xlabel('perturbation $\Delta$', fontsize=11)
+    ax.set_ylabel('test loss', fontsize=11)
+    ax.tick_params(axis='both', which='major', labelsize=11)
+    for spine in ax.spines.values():
+        spine.set_linewidth(0.75)
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 4)
+    ax.grid(False)
+    ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1), fontsize=10)
+    plt.tight_layout()
+    plt.savefig('uncertain_least_squares_results_with_mmd.png', dpi=300)
+    plt.show()
+
+# --- Main Program Entry ---
+if __name__ == '__main__':
+    # Using errstate to ignore potential overflow/underflow in exp, which can happen
+    # in intermediate calculations but may not affect the final result.
+    with np.errstate(all='ignore'):
+        delta_vals, all_results = run_experiment()
+        plot_results(delta_vals, all_results)
