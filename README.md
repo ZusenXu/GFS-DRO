@@ -1,1 +1,1 @@
-# Novel-Approaches-to-SDRO
+# GFS-DRO
