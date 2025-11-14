@@ -25,4 +25,9 @@ The repository includes the code for the numerical experiments presented in the 
 
 If you use this code or framework in your research, please cite our paper:
 
-> Zusen Xu and Jia-Jie Zhu. "Gradient Flow Sampler-based Distributionally Robust Optimization." Preprint, October 2025.
+> @article{xu2025gradient,
+  title={Gradient Flow Sampler-based Distributionally Robust Optimization},
+  author={Xu, Zusen and Zhu, Jia-Jie},
+  journal={arXiv preprint arXiv:2510.25956},
+  year={2025}
+}
